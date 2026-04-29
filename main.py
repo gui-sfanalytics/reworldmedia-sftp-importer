@@ -2,17 +2,20 @@ import paramiko
 import os
 import json
 import uuid
-from google.cloud import storage, secretmanager, bigquery
+from google.cloud import storage, bigquery
 from datetime import datetime, timezone
 
+PROJECT_ID        = os.environ.get("PROJECT_ID", "sfx-reworld-media")
+GCS_BUCKET        = os.environ.get("GCS_BUCKET")
+BQ_DATASET        = os.environ.get("BQ_DATASET", "import_data")
+BQ_TABLE          = os.environ.get("BQ_TABLE", "sylius_imports")
+BQ_LOG_TABLE      = os.environ.get("BQ_LOG_TABLE", "pipeline_logs")
+
 def get_sftp_credentials():
-    client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/reworldmedia/secrets/sftp-credentials/versions/latest"
-    response = client.access_secret_version(request={"name": name})
-    return json.loads(response.payload.data.decode("UTF-8"))
+    return json.loads(os.environ["SFTP_CREDENTIALS"])
 
 def log_to_bq(bq, job_id, file_name, status, started_at, ended_at=None, rows=None, error=None):
-    table_id = "reworldmedia.raw.pipeline_logs"
+    table_id = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_LOG_TABLE}"
     rows_to_insert = [{
         "job_id":        job_id,
         "file_name":     file_name,
@@ -28,7 +31,6 @@ def log_to_bq(bq, job_id, file_name, status, started_at, ended_at=None, rows=Non
 
 def transfer_sftp_to_gcs(request):
     creds = get_sftp_credentials()
-    today = datetime.now().strftime("%Y-%m-%d")
 
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -41,7 +43,7 @@ def transfer_sftp_to_gcs(request):
     sftp = ssh.open_sftp()
 
     gcs = storage.Client()
-    bucket = gcs.bucket(os.environ["GCS_BUCKET"])
+    bucket = gcs.bucket(GCS_BUCKET)
     bq = bigquery.Client()
 
     remote_dir = creds["dir"]
@@ -51,10 +53,13 @@ def transfer_sftp_to_gcs(request):
     for filename in sftp.listdir(remote_dir):
         if not filename.endswith(".csv"):
             continue
+
         blob = bucket.blob(f"{filename}")
+
         if blob.exists():
             print(f"Skipped: {filename}")
             continue
+
         with sftp.open(f"{remote_dir}{filename}", "rb") as f:
             blob.upload_from_file(f)
             print(f"Uploaded: {filename}")
@@ -64,12 +69,14 @@ def transfer_sftp_to_gcs(request):
     ssh.close()
 
     # Chargement GCS → BigQuery
+
     errors_list = []
+    
     for filename in transferred:
         job_id = str(uuid.uuid4())
         started_at = datetime.now(timezone.utc)
-        table_id = "reworldmedia.raw.order"
-        gcs_uri = f"gs://{os.environ['GCS_BUCKET']}/{filename}"
+        table_id = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+        gcs_uri = f"gs://{GCS_BUCKET}/{filename}"
 
 
         #Log START
@@ -88,6 +95,7 @@ def transfer_sftp_to_gcs(request):
         try:
             load_job = bq.load_table_from_uri(gcs_uri, table_id, job_config=job_config)
             load_job.result()
+
             ended_at = datetime.now(timezone.utc)
             rows = bq.get_table(table_id).num_rows
 
@@ -100,7 +108,6 @@ def transfer_sftp_to_gcs(request):
 
             # Log ERROR
             log_to_bq(bq, job_id, filename, "error", started_at, ended_at, error=str(e))
-            
             print(f"BigQuery ERROR {filename}: {e}")
             errors_list.append(filename)
 
