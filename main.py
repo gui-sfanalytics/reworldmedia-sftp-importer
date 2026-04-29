@@ -6,10 +6,11 @@ from google.cloud import storage, bigquery
 from datetime import datetime, timezone
 
 PROJECT_ID        = os.environ.get("PROJECT_ID", "sfx-reworld-media")
-GCS_BUCKET        = os.environ.get("GCS_BUCKET")
+GCS_BUCKET        = os.environ.get("GCS_BUCKET", "reworld_media_bucket")
 BQ_DATASET        = os.environ.get("BQ_DATASET", "import_data")
 BQ_TABLE          = os.environ.get("BQ_TABLE", "sylius_imports")
 BQ_LOG_TABLE      = os.environ.get("BQ_LOG_TABLE", "pipeline_logs")
+BQ_LOCATION       = os.environ.get("BQ_LOCATION", "EU")
 
 def get_sftp_credentials():
     return json.loads(os.environ["SFTP_CREDENTIALS"])
@@ -44,7 +45,7 @@ def transfer_sftp_to_gcs(request):
 
     gcs = storage.Client()
     bucket = gcs.bucket(GCS_BUCKET)
-    bq = bigquery.Client()
+    bq = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
 
     remote_dir = creds["dir"]
     transferred = []
