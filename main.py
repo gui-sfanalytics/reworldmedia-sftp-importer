@@ -15,7 +15,7 @@ BQ_LOCATION       = os.environ.get("BQ_LOCATION", "EU")
 def get_sftp_credentials():
     return json.loads(os.environ["SFTP_CREDENTIALS"])
 
-def log_to_bq(bq, job_id, file_name, status, started_at, ended_at=None, rows=None, error=None):
+def log_to_bq(bq, job_type, job_id, file_name, status, started_at, ended_at=None, rows=None, error=None):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_LOG_TABLE}"
     rows_to_insert = [{
         "job_id":        job_id,
@@ -25,6 +25,7 @@ def log_to_bq(bq, job_id, file_name, status, started_at, ended_at=None, rows=Non
         "ended_at":      ended_at.isoformat() if ended_at else None,
         "rows_inserted": rows,
         "error_message": error,
+        "job_type":     job_type,
     }]
     errors = bq.insert_rows_json(table_id, rows_to_insert)
     if errors:
@@ -52,6 +53,8 @@ def transfer_sftp_to_gcs(request):
 
 # Transfert SFTP → GCS
     for filename in sftp.listdir(remote_dir):
+        job_id = str(uuid.uuid4())
+        started_at = datetime.now(timezone.utc)
         if not filename.endswith(".csv"):
             continue
 
@@ -61,10 +64,18 @@ def transfer_sftp_to_gcs(request):
             print(f"Skipped: {filename}")
             continue
 
+        log_to_bq(bq, "sftp_to_gcs", job_id, filename, "started", started_at)
         with sftp.open(f"{remote_dir}{filename}", "rb") as f:
-            blob.upload_from_file(f)
-            print(f"Uploaded: {filename}")
-            transferred.append(filename)
+            try:
+                blob.upload_from_file(f)
+                ended_at = datetime.now(timezone.utc)
+                print(f"Uploaded: {filename}")
+                log_to_bq(bq, "sftp_to_gcs", job_id, filename, "success", started_at, ended_at)
+                transferred.append(filename)
+            except Exception as e:
+                print(f"Error uploading {filename}: {e}")
+                log_to_bq(bq, "sftp_to_gcs", job_id, filename, "error", started_at, ended_at, error=str(e))
+                continue
 
     sftp.close()
     ssh.close()
@@ -81,7 +92,7 @@ def transfer_sftp_to_gcs(request):
 
 
         #Log START
-        log_to_bq(bq, job_id, filename, "started", started_at)
+        log_to_bq(bq, "gcs_to_bq", job_id, filename, "started", started_at)
         
         job_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.CSV,
@@ -101,14 +112,14 @@ def transfer_sftp_to_gcs(request):
             rows = bq.get_table(table_id).num_rows
 
             # Log SUCCESS
-            log_to_bq(bq, job_id, filename, "success", started_at, ended_at, rows)
+            log_to_bq(bq, "gcs_to_bq", job_id, filename, "success", started_at, ended_at, rows)
             print(f"BigQuery OK: {table_id} — {rows} lignes total")
         
         except Exception as e:
             ended_at = datetime.now(timezone.utc)
 
             # Log ERROR
-            log_to_bq(bq, job_id, filename, "error", started_at, ended_at, error=str(e))
+            log_to_bq(bq, "gcs_to_bq", job_id, filename, "error", started_at, ended_at, error=str(e))
             print(f"BigQuery ERROR {filename}: {e}")
             errors_list.append(filename)
 
