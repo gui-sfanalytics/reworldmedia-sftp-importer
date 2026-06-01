@@ -1,5 +1,5 @@
-paramiko
-google-cloud-storage
-google-cloud-secret-manager
-google-cloud-bigquery
-functions-framework
+paramiko==2.12.0
+google-cloud-storage==2.19.0
+google-cloud-secret-manager==2.22.0
+google-cloud-bigquery==3.31.0
+functions-framework==3.8.2
