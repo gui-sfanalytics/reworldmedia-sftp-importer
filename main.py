@@ -12,10 +12,17 @@ BQ_TABLE          = os.environ.get("BQ_TABLE", "sylius_imports")
 BQ_LOG_TABLE      = os.environ.get("BQ_LOG_TABLE", "pipeline_logs")
 BQ_LOCATION       = os.environ.get("BQ_LOCATION", "EU")
 
+# Clés uniques qui identifient une ligne comme unique dans sylius_imports
+# ⚠️ À adapter selon votre schéma réel
+UNIQUE_KEYS = [
+    "purchase_id",
+]
+
 def get_sftp_credentials():
     return json.loads(os.environ["SFTP_CREDENTIALS"])
 
-def log_to_bq(bq, job_type, job_id, file_name, status, started_at, ended_at=None, rows=None, error=None):
+def log_to_bq(bq, job_type, job_id, file_name, status, started_at, 
+              ended_at=None, rows=None, error=None):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_LOG_TABLE}"
     rows_to_insert = [{
         "job_id":        job_id,
@@ -25,11 +32,97 @@ def log_to_bq(bq, job_type, job_id, file_name, status, started_at, ended_at=None
         "ended_at":      ended_at.isoformat() if ended_at else None,
         "rows_inserted": rows,
         "error_message": error,
-        "job_type":     job_type,
+        "job_type":      job_type,
     }]
     errors = bq.insert_rows_json(table_id, rows_to_insert)
     if errors:
         print(f"Log BQ error: {errors}")
+
+
+def get_staging_table_id(filename: str) -> str:
+    """
+    Génère un nom de table de staging unique par fichier.
+    Ex: sylius_imports_staging_mon_fichier_20240101
+    """
+    safe_name = filename.replace(".csv", "").replace("-", "_").replace(" ", "_")
+    return f"{PROJECT_ID}.{BQ_DATASET}.staging_{safe_name}"
+
+
+def load_to_staging(bq: bigquery.Client, gcs_uri: str, staging_table_id: str):
+    """
+    Charge le fichier CSV depuis GCS dans une table de staging temporaire.
+    La table est recréée à chaque exécution (WRITE_TRUNCATE).
+    """
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.CSV,
+        skip_leading_rows=1,
+        field_delimiter=";",
+        quote_character='"',
+        allow_quoted_newlines=True,
+        # WRITE_TRUNCATE : recrée la table staging proprement à chaque run
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        autodetect=False,
+        # Le schéma de la staging doit correspondre à la table cible
+        schema=bq.get_table(f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}").schema,
+    )
+
+    load_job = bq.load_table_from_uri(gcs_uri, staging_table_id, job_config=job_config)
+    load_job.result()
+    print(f"Staging chargée : {staging_table_id}")
+
+
+def merge_staging_to_target(bq: bigquery.Client, staging_table_id: str) -> int:
+    """
+    Fusionne la table staging dans la table cible.
+    - Si la ligne existe déjà (même clés uniques) → on ne fait rien (NOT UPDATE)
+    - Si la ligne est nouvelle → INSERT
+    Retourne le nombre de lignes insérées.
+    """
+    target_table_id = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+
+    # Récupère toutes les colonnes de la table cible
+    target_table = bq.get_table(target_table_id)
+    all_columns = [field.name for field in target_table.schema]
+
+    # Construction de la condition de jointure sur les clés uniques
+    join_condition = " AND ".join(
+        [f"T.{key} = S.{key}" for key in UNIQUE_KEYS]
+    )
+
+    # Construction des colonnes pour le INSERT
+    insert_columns = ", ".join(all_columns)
+    insert_values  = ", ".join([f"S.{col}" for col in all_columns])
+
+    merge_query = f"""
+        MERGE `{target_table_id}` AS T
+        USING `{staging_table_id}` AS S
+        ON {join_condition}
+
+        -- La ligne existe déjà → on ne fait rien
+        WHEN MATCHED THEN
+            UPDATE SET T.{all_columns[0]} = T.{all_columns[0]}  -- no-op update
+
+        -- La ligne est nouvelle → on insère
+        WHEN NOT MATCHED THEN
+            INSERT ({insert_columns})
+            VALUES ({insert_values})
+    """
+
+    query_job = bq.query(merge_query)
+    query_job.result()
+
+    # @@row_count n'est pas accessible via l'API Python,
+    # on retourne les stats du job
+    rows_inserted = query_job.num_dml_affected_rows or 0
+    print(f"Merge terminé : {rows_inserted} nouvelle(s) ligne(s) insérée(s)")
+    return rows_inserted
+
+
+def delete_staging_table(bq: bigquery.Client, staging_table_id: str):
+    """Supprime la table de staging après le merge."""
+    bq.delete_table(staging_table_id, not_found_ok=True)
+    print(f"Table staging supprimée : {staging_table_id}")
+
 
 def transfer_sftp_to_gcs(request):
     creds = get_sftp_credentials()
@@ -51,77 +144,73 @@ def transfer_sftp_to_gcs(request):
     remote_dir = creds["dir"]
     transferred = []
 
-# Transfert SFTP → GCS
+    # ─── 1. Transfert SFTP → GCS ────────────────────────────────────────────
     for filename in sftp.listdir(remote_dir):
-        job_id = str(uuid.uuid4())
-        started_at = datetime.now(timezone.utc)
         if not filename.endswith(".csv"):
             continue
 
-        blob = bucket.blob(f"{filename}")
+        job_id     = str(uuid.uuid4())
+        started_at = datetime.now(timezone.utc)
+        blob       = bucket.blob(filename)
 
         if blob.exists():
-            print(f"Skipped: {filename}")
+            print(f"Skipped (déjà dans GCS) : {filename}")
             continue
 
         log_to_bq(bq, "sftp_to_gcs", job_id, filename, "started", started_at)
+
         with sftp.open(f"{remote_dir}{filename}", "rb") as f:
             try:
                 blob.upload_from_file(f)
                 ended_at = datetime.now(timezone.utc)
-                print(f"Uploaded: {filename}")
-                log_to_bq(bq, "sftp_to_gcs", job_id, filename, "success", started_at, ended_at)
+                print(f"Uploaded : {filename}")
+                log_to_bq(bq, "sftp_to_gcs", job_id, filename, 
+                          "success", started_at, ended_at)
                 transferred.append(filename)
+
             except Exception as e:
-                print(f"Error uploading {filename}: {e}")
-                log_to_bq(bq, "sftp_to_gcs", job_id, filename, "error", started_at, ended_at, error=str(e))
-                continue
+                ended_at = datetime.now(timezone.utc)
+                print(f"Erreur upload {filename} : {e}")
+                log_to_bq(bq, "sftp_to_gcs", job_id, filename, 
+                          "error", started_at, ended_at, error=str(e))
 
     sftp.close()
     ssh.close()
 
-    # Chargement GCS → BigQuery
-
+    # ─── 2. Chargement GCS → BigQuery (via staging + merge) ─────────────────
     errors_list = []
-    
+
     for filename in transferred:
-        job_id = str(uuid.uuid4())
+        job_id     = str(uuid.uuid4())
         started_at = datetime.now(timezone.utc)
-        table_id = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
-        gcs_uri = f"gs://{GCS_BUCKET}/{filename}"
+        gcs_uri    = f"gs://{GCS_BUCKET}/{filename}"
 
+        staging_table_id = get_staging_table_id(filename)
 
-        #Log START
         log_to_bq(bq, "gcs_to_bq", job_id, filename, "started", started_at)
-        
-        job_config = bigquery.LoadJobConfig(
-            source_format=bigquery.SourceFormat.CSV,
-            skip_leading_rows=1,
-            field_delimiter=";",                              # séparateur point-virgule
-            quote_character='"',                              # valeurs entre guillemets
-            allow_quoted_newlines=True,                       # gère les sauts de ligne dans les champs quotés
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,  # append
-            autodetect=False,                                 # schéma existant → pas d'autodetect
-        )
 
         try:
-            load_job = bq.load_table_from_uri(gcs_uri, table_id, job_config=job_config)
-            load_job.result()
+            # Étape A : charger dans la staging
+            load_to_staging(bq, gcs_uri, staging_table_id)
+
+            # Étape B : merger dans la table cible (dédoublonnage)
+            rows_inserted = merge_staging_to_target(bq, staging_table_id)
 
             ended_at = datetime.now(timezone.utc)
-            rows = bq.get_table(table_id).num_rows
+            log_to_bq(bq, "gcs_to_bq", job_id, filename, 
+                      "success", started_at, ended_at, rows_inserted)
+            print(f"BigQuery OK : {filename} — {rows_inserted} nouvelle(s) ligne(s)")
 
-            # Log SUCCESS
-            log_to_bq(bq, "gcs_to_bq", job_id, filename, "success", started_at, ended_at, rows)
-            print(f"BigQuery OK: {table_id} — {rows} lignes total")
-        
         except Exception as e:
             ended_at = datetime.now(timezone.utc)
-
-            # Log ERROR
-            log_to_bq(bq, "gcs_to_bq", job_id, filename, "error", started_at, ended_at, error=str(e))
-            print(f"BigQuery ERROR {filename}: {e}")
+            print(f"BigQuery ERROR {filename} : {e}")
+            log_to_bq(bq, "gcs_to_bq", job_id, filename, 
+                      "error", started_at, ended_at, error=str(e))
             errors_list.append(filename)
+
+        finally:
+            # Étape C : nettoyage de la staging dans tous les cas
+            delete_staging_table(bq, staging_table_id)
 
     status = "partial" if errors_list else "success"
     return f"{len(transferred)} fichier(s) transféré(s), statut: {status}", 200
