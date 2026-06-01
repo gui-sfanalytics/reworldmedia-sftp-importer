@@ -95,12 +95,23 @@ def merge_staging_to_target(bq: bigquery.Client, staging_table_id: str) -> int:
 
     merge_query = f"""
         MERGE `{target_table_id}` AS T
-        USING `{staging_table_id}` AS S
+        USING (
+            SELECT * EXCEPT(row_num)
+            FROM (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY {", ".join(UNIQUE_KEYS)}
+                        ORDER BY (SELECT NULL)
+                    ) AS row_num
+                FROM `{staging_table_id}`
+            )
+            WHERE row_num = 1
+        ) AS S
         ON {join_condition}
 
         -- La ligne existe déjà → on ne fait rien
         WHEN MATCHED THEN
-            UPDATE SET T.{all_columns[0]} = T.{all_columns[0]}  -- no-op update
+            UPDATE SET T.{all_columns[0]} = T.{all_columns[0]}
 
         -- La ligne est nouvelle → on insère
         WHEN NOT MATCHED THEN
