@@ -4,6 +4,8 @@ import json
 import uuid
 from google.cloud import storage, bigquery
 from datetime import datetime, timezone
+from google.api_core.exceptions import NotFound
+from google.cloud import bigquery
 
 PROJECT_ID        = os.environ.get("PROJECT_ID", "sfx-reworld-media")
 GCS_BUCKET        = os.environ.get("GCS_BUCKET", "reworld_media_bucket")
@@ -23,20 +25,127 @@ def get_sftp_credentials():
 
 def log_to_bq(bq, job_type, job_id, file_name, status, started_at, 
               ended_at=None, rows=None, error=None):
-    table_id = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_LOG_TABLE}"
-    rows_to_insert = [{
-        "job_id":        job_id,
-        "file_name":     file_name,
-        "status":        status,
-        "started_at":    started_at.isoformat(),
-        "ended_at":      ended_at.isoformat() if ended_at else None,
-        "rows_inserted": rows,
-        "error_message": error,
-        "job_type":      job_type,
-    }]
-    errors = bq.insert_rows_json(table_id, rows_to_insert)
-    if errors:
-        print(f"Log BQ error: {errors}")
+    try:
+        table_id = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_LOG_TABLE}"
+        rows_to_insert = [{
+            "job_id": job_id,
+            "file_name": file_name,
+            "status": status,
+            "started_at": started_at.isoformat(),
+            "ended_at": ended_at.isoformat() if ended_at else None,
+            "rows_inserted": rows,
+            "error_message": error,
+            "job_type": job_type,
+        }]
+        errors = bq.insert_rows_json(table_id, rows_to_insert)
+        if errors:
+            print(f"Log BQ error: {errors}")
+    except Exception as e:
+        print(f"Logging FAILED (non bloquant): {e}")
+
+
+def ensure_dataset_exists(bq: bigquery.Client, dataset_id: str):
+    try:
+        bq.get_dataset(dataset_id)
+    except NotFound:
+        dataset = bigquery.Dataset(dataset_id)
+        dataset.location = BQ_LOCATION
+        bq.create_dataset(dataset)
+        print(f"Dataset créé : {dataset_id}")
+
+
+def ensure_table_exists(bq: bigquery.Client, table_id: str, schema: list):
+    try:
+        bq.get_table(table_id)
+    except NotFound:
+        table = bigquery.Table(table_id, schema=schema)
+        bq.create_table(table)
+        print(f"Table créée : {table_id}")
+
+def get_pipeline_logs_schema():
+    return [
+        bigquery.SchemaField("job_id", "STRING"),
+        bigquery.SchemaField("file_name", "STRING"),
+        bigquery.SchemaField("status", "STRING"),
+        bigquery.SchemaField("started_at", "TIMESTAMP"),
+        bigquery.SchemaField("ended_at", "TIMESTAMP"),
+        bigquery.SchemaField("rows_inserted", "INT64"),
+        bigquery.SchemaField("error_message", "STRING"),
+        bigquery.SchemaField("job_type", "STRING"),
+    ]
+
+def get_sylius_schema():
+    return [
+        bigquery.SchemaField("order_id", "STRING"),
+        bigquery.SchemaField("purchase_id", "STRING"),
+        bigquery.SchemaField("payer_subscriber_id", "STRING"),
+        bigquery.SchemaField("idefix_response", "STRING"),
+
+        bigquery.SchemaField("purchase_day", "STRING"),
+        bigquery.SchemaField("purchase_month", "STRING"),
+        bigquery.SchemaField("purchase_year", "STRING"),
+        bigquery.SchemaField("purchase_time", "STRING"),
+
+        bigquery.SchemaField("billing_customer", "STRING"),
+        bigquery.SchemaField("shipping_customer", "STRING"),
+
+        bigquery.SchemaField("order_state", "STRING"),
+        bigquery.SchemaField("payment_state", "STRING"),
+        bigquery.SchemaField("payment_method", "STRING"),
+
+        bigquery.SchemaField("billing_country", "STRING"),
+        bigquery.SchemaField("shipping_country", "STRING"),
+
+        bigquery.SchemaField("discount_rules", "STRING"),
+        bigquery.SchemaField("product_name", "STRING"),
+        bigquery.SchemaField("title_code", "STRING"),
+        bigquery.SchemaField("doc_code", "STRING"),
+        bigquery.SchemaField("choice", "STRING"),
+
+        bigquery.SchemaField("prime_1", "STRING"),
+        bigquery.SchemaField("prime_2", "STRING"),
+        bigquery.SchemaField("prime_3", "STRING"),
+
+        bigquery.SchemaField("product_type", "STRING"),
+
+        bigquery.SchemaField("taxon_1", "STRING"),
+        bigquery.SchemaField("taxon_2", "STRING"),
+        bigquery.SchemaField("taxon_3", "STRING"),
+        bigquery.SchemaField("taxon_4", "STRING"),
+
+        bigquery.SchemaField("is_couplage", "STRING"),
+        bigquery.SchemaField("add_or_adl", "STRING"),
+        bigquery.SchemaField("renewal_offer", "STRING"),
+        bigquery.SchemaField("is_extension", "STRING"),
+
+        bigquery.SchemaField("periodicity", "STRING"),
+        bigquery.SchemaField("prelevement", "STRING"),
+        bigquery.SchemaField("is_multi", "STRING"),
+        bigquery.SchemaField("operation", "STRING"),
+        bigquery.SchemaField("is_abo_premium", "STRING"),
+
+        bigquery.SchemaField("issue_number", "STRING"),
+        bigquery.SchemaField("format", "STRING"),
+
+        bigquery.SchemaField("product_analytic_value", "STRING"),
+        bigquery.SchemaField("order_analytic_value", "STRING"),
+
+        bigquery.SchemaField("unit_price", "STRING"),
+        bigquery.SchemaField("quantity", "STRING"),
+
+        bigquery.SchemaField("order_amount_excl_shipping", "STRING"),
+        bigquery.SchemaField("purchase_amount_excl_shipping", "STRING"),
+
+        bigquery.SchemaField("purchase_discount", "STRING"),
+        bigquery.SchemaField("order_discount", "STRING"),
+
+        bigquery.SchemaField("shipping_cost", "STRING"),
+
+        bigquery.SchemaField("utm_source", "STRING"),
+        bigquery.SchemaField("utm_medium", "STRING"),
+        bigquery.SchemaField("utm_campaign", "STRING"),
+    ]
+
 
 
 def get_staging_table_id(filename: str) -> str:
@@ -53,17 +162,24 @@ def load_to_staging(bq: bigquery.Client, gcs_uri: str, staging_table_id: str):
     Charge le fichier CSV depuis GCS dans une table de staging temporaire.
     La table est recréée à chaque exécution (WRITE_TRUNCATE).
     """
+    schema = None
+    try:
+        schema = bq.get_table(f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}").schema
+    except NotFound:
+        schema = get_sylius_schema()
+
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.CSV,
         skip_leading_rows=1,
         field_delimiter=";",
         quote_character='"',
         allow_quoted_newlines=True,
+        ignore_unknown_values=True,
         # WRITE_TRUNCATE : recrée la table staging proprement à chaque run
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         autodetect=False,
         # Le schéma de la staging doit correspondre à la table cible
-        schema=bq.get_table(f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}").schema,
+        schema = schema,
     )
 
     load_job = bq.load_table_from_uri(gcs_uri, staging_table_id, job_config=job_config)
@@ -154,6 +270,15 @@ def transfer_sftp_to_gcs(request):
 
     remote_dir = creds["dir"]
     transferred = []
+
+    dataset_id = f"{PROJECT_ID}.{BQ_DATASET}"
+    target_table_id = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+    log_table_id = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_LOG_TABLE}"
+
+    # Ensure infra ok
+    ensure_dataset_exists(bq, dataset_id)
+    ensure_table_exists(bq, target_table_id, get_sylius_schema())
+    ensure_table_exists(bq, log_table_id, get_pipeline_logs_schema())
 
     # ─── 1. Transfert SFTP → GCS ────────────────────────────────────────────
     for filename in sftp.listdir(remote_dir):
