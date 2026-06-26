@@ -2,6 +2,7 @@ import paramiko
 import os
 import json
 import uuid
+import re
 from google.cloud import storage, bigquery
 from datetime import datetime, timezone
 from google.api_core.exceptions import NotFound
@@ -281,8 +282,14 @@ def transfer_sftp_to_gcs(request):
     ensure_table_exists(bq, log_table_id, get_pipeline_logs_schema())
 
     # ─── 1. Transfert SFTP → GCS ────────────────────────────────────────────
+    # Regex acceptant uniquement les formats attendus :
+    #   export-sylius-km_YYYYMMDD.csv
+    #   export-sylius-km_YYYYMMDD-YYYYMMDD.csv
+    VALID_FILENAME_RE = re.compile(r"^export-sylius-km_\d{8}(-\d{8})?\.csv$")
+
     for filename in sftp.listdir(remote_dir):
-        if not filename.endswith(".csv"):
+        if not VALID_FILENAME_RE.match(filename):
+            print(f"Skipped (nom de fichier invalide) : {filename}")
             continue
 
         job_id     = str(uuid.uuid4())
