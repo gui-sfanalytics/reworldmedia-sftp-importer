@@ -21,6 +21,20 @@ UNIQUE_KEYS = [
     "purchase_id",
 ]
 
+# ─── Forçage du mode de paiement à "offline" selon le produit ──────────
+OFFLINE_PAYMENT_CONDITION = """
+    (TRIM(S.title_code) = '617'
+        AND TRIM(S.doc_code) IN ('509284', '514710', '514711')
+        AND TRIM(S.choice)   IN ('1', '2', '3'))
+    OR
+    (TRIM(S.title_code) = '902'
+        AND TRIM(S.doc_code) = '2059053'
+        AND TRIM(S.choice)   = '1')
+"""
+
+def build_payment_method_expr() -> str:
+    return f"CASE WHEN {OFFLINE_PAYMENT_CONDITION} THEN 'offline' ELSE S.payment_method END"
+
 def get_sftp_credentials():
     return json.loads(os.environ["SFTP_CREDENTIALS"])
 
@@ -208,7 +222,10 @@ def merge_staging_to_target(bq: bigquery.Client, staging_table_id: str) -> int:
 
     # Construction des colonnes pour le INSERT
     insert_columns = ", ".join(all_columns)
-    insert_values  = ", ".join([f"S.{col}" for col in all_columns])
+    insert_values = ", ".join(
+        build_payment_method_expr() if col == "payment_method" else f"S.{col}"
+        for col in all_columns
+    )
 
     merge_query = f"""
         MERGE `{target_table_id}` AS T
