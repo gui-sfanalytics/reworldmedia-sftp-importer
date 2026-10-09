@@ -23,12 +23,14 @@ UNIQUE_KEYS = [
 
 # ─── Forçage du mode de paiement à "offline" selon le produit ──────────
 OFFLINE_PAYMENT_CONDITION = """
+    LOWER(TRIM(S.payment_method)) = 'offline'
+    OR
     (TRIM(S.title_code) = '617'
         AND TRIM(S.doc_code) IN ('509284', '514710', '514711')
         AND TRIM(S.choice)   IN ('1', '2', '3'))
     OR
     (TRIM(S.title_code) = '902'
-        AND TRIM(S.doc_code) = '2059053'
+        AND TRIM(S.doc_code) = '2152064' 
         AND TRIM(S.choice)   = '1')
 """
 
